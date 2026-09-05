@@ -1,0 +1,21 @@
+# Build output and intermediate files.
+bin/
+obj/
+
+# Keep the current self-contained publish artifact, but ignore any additional
+# files that may be generated beside it.
+publish/*
+!publish/
+!publish/EcloudKeepAlive.exe
+
+# Local diagnostics and user-specific Visual Studio files.
+logs/
+*.log
+*.user
+*.suo
+*.csproj.user
+*.pdb
+
+# Local FRP configuration may contain server credentials.
+frpc.ini
+frpc.toml
