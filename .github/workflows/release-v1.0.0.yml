@@ -1,10 +1,19 @@
 name: Release v1.0.0
 
 on:
+  pull_request:
+    branches:
+      - main
+    paths:
+      - EcloudKeepAlive.cs
+      - EcloudKeepAlive.csproj
+      - .github/workflows/release-v1.0.0.yml
   push:
     branches:
       - main
     paths:
+      - EcloudKeepAlive.cs
+      - EcloudKeepAlive.csproj
       - .github/workflows/release-v1.0.0.yml
   workflow_dispatch:
 
@@ -81,6 +90,7 @@ jobs:
           '@ | Set-Content -Path 'release-notes.md' -Encoding utf8
 
       - name: Create or update GitHub Release
+        if: github.event_name != 'pull_request'
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
