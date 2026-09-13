@@ -110,3 +110,5 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
           gh release edit $tag --draft=false --latest --title 'EcloudKeepAlive v1.0.0' --notes-file 'release-notes.md'
+
+# v1.0.0 verification trigger
