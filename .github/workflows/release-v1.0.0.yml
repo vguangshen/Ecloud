@@ -1,19 +1,23 @@
-name: Release v1.0.0
+name: Build and release
 
 on:
   pull_request:
     branches:
       - main
     paths:
-      - EcloudKeepAlive.cs
+      - '*.cs'
       - EcloudKeepAlive.csproj
+      - app.manifest
+      - tests/**
       - .github/workflows/release-v1.0.0.yml
   push:
     branches:
       - main
     paths:
-      - EcloudKeepAlive.cs
+      - '*.cs'
       - EcloudKeepAlive.csproj
+      - app.manifest
+      - tests/**
       - .github/workflows/release-v1.0.0.yml
   workflow_dispatch:
 
@@ -23,6 +27,7 @@ permissions:
 jobs:
   build-release:
     runs-on: windows-latest
+    timeout-minutes: 15
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -32,8 +37,19 @@ jobs:
         with:
           dotnet-version: 8.0.x
 
+      - name: Read release version
+        id: version
+        shell: pwsh
+        run: |
+          $version = ([xml](Get-Content 'EcloudKeepAlive.csproj' -Raw)).Project.PropertyGroup.Version
+          if ($version -notmatch '^\d+\.\d+\.\d+$') { throw 'Invalid release version.' }
+          "version=$version" | Out-File $env:GITHUB_OUTPUT -Append -Encoding utf8
+
       - name: Restore
         run: dotnet restore EcloudKeepAlive.csproj
+
+      - name: Run scheduler and Windows task regression checks
+        run: dotnet run --project tests/RegressionTests.csproj -c Release
 
       - name: Publish win-x64 single-file
         run: >-
@@ -48,8 +64,14 @@ jobs:
           -p:DebugType=None
           -p:DebugSymbols=false
 
+      - name: Verify real Windows update and restart
+        shell: pwsh
+        run: ./tests/UpdateSmoke.ps1 -Executable artifact/EcloudKeepAlive.exe
+
       - name: Verify output and package
         shell: pwsh
+        env:
+          APP_VERSION: ${{ steps.version.outputs.version }}
         run: |
           $exe = Join-Path $PWD 'artifact/EcloudKeepAlive.exe'
           if (-not (Test-Path $exe)) {
@@ -64,49 +86,41 @@ jobs:
           $hash = (Get-FileHash $exe -Algorithm SHA256).Hash.ToLowerInvariant()
           Set-Content -Path 'artifact/EcloudKeepAlive.exe.sha256' -Value "$hash  EcloudKeepAlive.exe" -Encoding ascii
 
-          Compress-Archive -Path $exe -DestinationPath 'artifact/EcloudKeepAlive-v1.0.0-win-x64.zip' -Force
+          Compress-Archive -Path $exe -DestinationPath "artifact/EcloudKeepAlive-v$env:APP_VERSION-win-x64.zip" -Force
+          $notes = Get-Content 'RELEASE-NOTES.md' -Raw
+          "# EcloudKeepAlive v$env:APP_VERSION`n`n$notes" | Set-Content 'release-notes.md' -Encoding utf8
 
-          @'
-          # EcloudKeepAlive v1.0.0
-
-          首个正式版本。
-
-          ## 功能
-          - 定时启动移动云电脑客户端进行保活
-          - 可配置启动后自动结束客户端进程及延迟时间
-          - 支持开机自动运行并通过 Windows 计划任务启用无人值守保活
-          - 支持自动启动 frpc
-          - 支持可选的开机自动设置当前 Windows 用户密码
-          - 托盘运行、立即保活、状态查看与设置持久化
-
-          ## 下载
-          - `EcloudKeepAlive.exe`：Windows x64 自包含单文件，可直接运行
-          - `EcloudKeepAlive-v1.0.0-win-x64.zip`：压缩包版本
-          - `EcloudKeepAlive.exe.sha256`：SHA-256 校验值
-
-          ## 系统要求
-          - Windows 10/11 x64
-          - 无需单独安装 .NET Runtime
-          '@ | Set-Content -Path 'release-notes.md' -Encoding utf8
+      - name: Upload verified build for review
+        uses: actions/upload-artifact@v4
+        with:
+          name: EcloudKeepAlive-win-x64
+          path: artifact/*
+          retention-days: 14
 
       - name: Create or update GitHub Release
         if: github.event_name != 'pull_request'
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
+          APP_VERSION: ${{ steps.version.outputs.version }}
         run: |
-          $tag = 'v1.0.0'
-          gh release view $tag *> $null
-          if ($LASTEXITCODE -ne 0) {
-            gh release create $tag --draft --target $env:GITHUB_SHA --title 'EcloudKeepAlive v1.0.0' --notes-file 'release-notes.md'
+          $tag = "v$env:APP_VERSION"
+          $existing = gh release view $tag --json isDraft,targetCommitish 2>$null
+          if ($LASTEXITCODE -eq 0) {
+            $release = $existing | ConvertFrom-Json
+            if ($release.targetCommitish -ne $env:GITHUB_SHA) { throw 'Version already exists at another commit; increment the project version.' }
+            if (-not $release.isDraft) { Write-Host 'This commit is already published; leaving its assets intact.'; exit 0 }
+          } else {
+            gh release create $tag --draft --target $env:GITHUB_SHA --title "EcloudKeepAlive $tag" --notes-file 'release-notes.md'
             if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           }
 
           gh release upload $tag `
             'artifact/EcloudKeepAlive.exe' `
-            'artifact/EcloudKeepAlive-v1.0.0-win-x64.zip' `
+            "artifact/EcloudKeepAlive-v$env:APP_VERSION-win-x64.zip" `
             'artifact/EcloudKeepAlive.exe.sha256' `
             --clobber
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
-          gh release edit $tag --draft=false --latest --title 'EcloudKeepAlive v1.0.0' --notes-file 'release-notes.md'
+          gh release edit $tag --draft=false --latest --title "EcloudKeepAlive $tag" --notes-file 'release-notes.md'
+
