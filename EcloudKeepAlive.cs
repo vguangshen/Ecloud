@@ -7,8 +7,12 @@ using System.Drawing;
 using System.IO;
 using System.Runtime.InteropServices;
 using System.Security.Cryptography;
+using System.Security.Principal;
 using System.Text;
+using System.Threading;
+using System.Threading.Tasks;
 using System.Windows.Forms;
+using Timer = System.Windows.Forms.Timer;
 
 namespace EcloudKeepAlive
 {
@@ -21,6 +25,25 @@ namespace EcloudKeepAlive
         [STAThread]
         private static void Main()
         {
+            if (HasArgument("--apply-update"))
+            {
+                try
+                {
+                    UpdateInstaller.RunHelper(ArgumentValue("--apply-update"), target =>
+                    {
+                        string error;
+                        if (!MainForm.RegisterWindowsStartupTask(out error, target)) throw new InvalidOperationException(error);
+                    });
+                }
+                catch (Exception ex)
+                {
+                    Environment.ExitCode = 1;
+                    UpdateInstaller.ReportHelperError(ArgumentValue("--apply-update"), ex.Message);
+                    MessageBox.Show("在线更新未完成：\r\n" + ex.Message, AppName, MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                }
+                return;
+            }
+
             if (HasArgument(RegisterStartupTaskArgument))
             {
                 string errorMessage;
@@ -60,7 +83,7 @@ namespace EcloudKeepAlive
             }
         }
 
-        private static bool HasArgument(string expected)
+        internal static bool HasArgument(string expected)
         {
             foreach (var argument in Environment.GetCommandLineArgs())
             {
@@ -71,6 +94,14 @@ namespace EcloudKeepAlive
             }
 
             return false;
+        }
+
+        internal static string ArgumentValue(string name)
+        {
+            var arguments = Environment.GetCommandLineArgs();
+            for (var i = 1; i + 1 < arguments.Length; i++)
+                if (string.Equals(arguments[i], name, StringComparison.OrdinalIgnoreCase)) return arguments[i + 1];
+            return null;
         }
     }
 
@@ -109,6 +140,15 @@ namespace EcloudKeepAlive
         private Label statusLabel;
         private Button startButton;
         private Button stopButton;
+        private TabControl mainTabs;
+        private TabPage updatePage;
+        private Button checkUpdateButton;
+        private Button installUpdateButton;
+        private Button cancelUpdateButton;
+        private Label updateStatusLabel;
+        private TextBox releaseNotesTextBox;
+        private ReleaseUpdateInfo availableUpdate;
+        private CancellationTokenSource updateCancellation;
         private bool isAttemptRunning;
         private bool settingsReadFailed;
         private string lastStatusMessage = "未启动";
@@ -157,7 +197,15 @@ namespace EcloudKeepAlive
             WriteLog("程序启动，命令行启动模式：" + IsStartedFromWindowsStartup());
             RunStartupTasks();
 
-            if (IsStartedFromWindowsStartup())
+            Shown += delegate
+            {
+                var readyPath = Program.ArgumentValue("--update-ready");
+                if (readyPath == null) return;
+                try { UpdateInstaller.SignalReady(readyPath); }
+                catch (Exception ex) { WriteLog("更新启动确认失败：" + ex.Message); }
+            };
+
+            if (IsStartedFromWindowsStartup() || Program.HasArgument("--resume-keepalive"))
             {
                 StartKeepAlive(false);
             }
@@ -226,6 +274,7 @@ namespace EcloudKeepAlive
             header.Controls.Add(statusPill, 1, 0);
 
             var tabs = new TabControl();
+            mainTabs = tabs;
             tabs.Dock = DockStyle.Fill;
             tabs.Font = new Font(Font.FontFamily, 9F);
             shell.Controls.Add(tabs, 0, 1);
@@ -233,13 +282,162 @@ namespace EcloudKeepAlive
             var keepAlivePage = CreateTabPage("保活");
             var startupPage = CreateTabPage("启动项");
             var statusPage = CreateTabPage("状态");
+            updatePage = CreateTabPage("更新");
             tabs.TabPages.Add(keepAlivePage);
             tabs.TabPages.Add(startupPage);
             tabs.TabPages.Add(statusPage);
+            tabs.TabPages.Add(updatePage);
 
             BuildKeepAlivePage(keepAlivePage);
             BuildStartupPage(startupPage);
             BuildStatusPage(statusPage);
+            BuildUpdatePage(updatePage);
+        }
+
+        private void BuildUpdatePage(TabPage page)
+        {
+            var root = CreatePageLayout(2);
+            page.Controls.Add(root);
+            var card = CreateCard("软件更新", 3);
+            root.Controls.Add(card, 0, 0);
+            card.Controls.Add(CreateFieldLabel("当前版本"), 0, 0);
+            card.Controls.Add(CreateValueLabel("v" + CurrentVersion.ToString(3)), 1, 0);
+            var actions = CreateInlinePanel();
+            checkUpdateButton = CreateButton("检查更新", 100, false);
+            installUpdateButton = CreateButton("在线更新", 100, true);
+            cancelUpdateButton = CreateButton("取消", 70, false);
+            installUpdateButton.Enabled = false;
+            cancelUpdateButton.Enabled = false;
+            checkUpdateButton.Click += async delegate { await CheckForUpdatesAsync(); };
+            installUpdateButton.Click += async delegate { await InstallUpdateAsync(); };
+            cancelUpdateButton.Click += delegate { updateCancellation?.Cancel(); };
+            actions.Controls.Add(checkUpdateButton);
+            actions.Controls.Add(installUpdateButton);
+            actions.Controls.Add(cancelUpdateButton);
+            card.Controls.Add(actions, 0, 1);
+            card.SetColumnSpan(actions, 3);
+            updateStatusLabel = new Label
+            {
+                Text = "从公开 GitHub Release 获取更新，无需登录。", AutoSize = true,
+                MaximumSize = new Size(460, 0), Margin = new Padding(0, 10, 0, 4)
+            };
+            card.Controls.Add(updateStatusLabel, 0, 2);
+            card.SetColumnSpan(updateStatusLabel, 3);
+            releaseNotesTextBox = new TextBox
+            {
+                Dock = DockStyle.Fill, Multiline = true, ReadOnly = true, ScrollBars = ScrollBars.Vertical,
+                Height = 160, MinimumSize = new Size(0, 160), BackColor = Color.White, Text = "点击“检查更新”查看新版本说明。"
+            };
+            root.Controls.Add(releaseNotesTextBox, 0, 1);
+        }
+
+        private static Version CurrentVersion
+        {
+            get { return ReleaseUpdateClient.NormalizeVersion(typeof(Program).Assembly.GetName().Version); }
+        }
+
+        private void SetUpdateBusy(bool busy)
+        {
+            checkUpdateButton.Enabled = !busy;
+            installUpdateButton.Enabled = !busy && availableUpdate != null && availableUpdate.Version > CurrentVersion;
+            cancelUpdateButton.Enabled = busy;
+        }
+
+        private async Task CheckForUpdatesAsync()
+        {
+            if (updateCancellation != null) return;
+            mainTabs.SelectedTab = updatePage;
+            var cancellation = new CancellationTokenSource(TimeSpan.FromSeconds(60));
+            updateCancellation = cancellation;
+            availableUpdate = null;
+            SetUpdateBusy(true);
+            updateStatusLabel.Text = "正在检查最新正式版本...";
+            try
+            {
+                using (var client = new ReleaseUpdateClient())
+                    availableUpdate = await client.CheckAsync(cancellation.Token);
+                if (IsDisposed || Disposing) return;
+                releaseNotesTextBox.Text = availableUpdate.Notes.Replace("\n", "\r\n").Replace("\r\r\n", "\r\n");
+                updateStatusLabel.Text = availableUpdate.Version > CurrentVersion
+                    ? "发现 " + availableUpdate.Tag + "，可点击“在线更新”。更新完成后将自动恢复当前保活状态。"
+                    : "当前已经是最新版本。";
+                WriteLog("检查更新完成：" + availableUpdate.Tag);
+            }
+            catch (OperationCanceledException)
+            {
+                if (!IsDisposed && !Disposing) updateStatusLabel.Text = "检查已取消或超时。";
+            }
+            catch (Exception ex)
+            {
+                WriteLog("检查更新失败：" + ex.Message);
+                if (!IsDisposed && !Disposing) updateStatusLabel.Text = "检查失败：" + ex.Message;
+            }
+            finally
+            {
+                updateCancellation = null;
+                cancellation.Dispose();
+                if (!IsDisposed && !Disposing) SetUpdateBusy(false);
+            }
+        }
+
+        private async Task InstallUpdateAsync()
+        {
+            if (updateCancellation != null || availableUpdate == null || availableUpdate.Version <= CurrentVersion) return;
+            if (MessageBox.Show("下载并安装 " + availableUpdate.Tag + "？\r\n将校验文件、保留旧版备份并自动重启。可能需要 Windows 管理员授权。",
+                Text, MessageBoxButtons.YesNo, MessageBoxIcon.Question) != DialogResult.Yes) return;
+            if (!SaveSettings(true)) return;
+            var cancellation = new CancellationTokenSource(TimeSpan.FromMinutes(15));
+            updateCancellation = cancellation;
+            SetUpdateBusy(true);
+            string requestPath = null;
+            try
+            {
+                var directory = UpdateInstaller.CreateStagingDirectory();
+                DownloadedUpdate downloaded;
+                var progress = new Progress<int>(percent =>
+                {
+                    if (!IsDisposed && !Disposing) updateStatusLabel.Text = "正在下载更新：" + percent + "%（保活仍在运行）";
+                });
+                using (var client = new ReleaseUpdateClient())
+                    downloaded = await client.DownloadAsync(availableUpdate, directory, progress, cancellation.Token);
+                if (IsDisposed || Disposing) return;
+                if (!SaveSettings(true)) return;
+                using (var currentProcess = Process.GetCurrentProcess())
+                using (var identity = WindowsIdentity.GetCurrent())
+                {
+                    requestPath = UpdateInstaller.WriteRequest(directory, new UpdateInstallRequest
+                    {
+                        ParentProcessId = Environment.ProcessId,
+                        ParentStartTimeUtcTicks = currentProcess.StartTime.ToUniversalTime().Ticks,
+                        OriginalUserSid = identity.User.Value, TargetPath = Application.ExecutablePath,
+                        ExpectedHash = downloaded.Sha256, ResumeKeepAlive = schedule.Enabled,
+                        RefreshStartupTask = IsStartupTaskRegistered(),
+                        LogPath = Path.Combine(Path.GetDirectoryName(settingsPath), "runtime.log")
+                    });
+                }
+                updateStatusLabel.Text = "文件校验通过，正在准备更新器...";
+                using (var helper = UpdateInstaller.StartHelper(downloaded.ExecutablePath, requestPath))
+                    await UpdateInstaller.WaitForHandoffAsync(helper, requestPath, cancellation.Token);
+                if (IsDisposed || Disposing) return;
+                WriteLog("更新器已就绪，准备替换为 " + availableUpdate.Tag);
+                reallyExit = true;
+                Close();
+            }
+            catch (OperationCanceledException)
+            {
+                if (!IsDisposed && !Disposing) updateStatusLabel.Text = "更新已取消，当前程序继续运行。";
+            }
+            catch (Exception ex)
+            {
+                WriteLog("在线更新失败：" + ex.Message);
+                if (!IsDisposed && !Disposing) updateStatusLabel.Text = "更新未完成：" + ex.Message;
+            }
+            finally
+            {
+                updateCancellation = null;
+                cancellation.Dispose();
+                if (!IsDisposed && !Disposing) SetUpdateBusy(false);
+            }
         }
 
         private TabPage CreateTabPage(string text)
@@ -617,6 +815,7 @@ namespace EcloudKeepAlive
             menu.Items.Add("立即保活", null, delegate { RunKeepAliveNow(); });
             menu.Items.Add("启动 frpc", null, delegate { StartFrpc(true); });
             menu.Items.Add("注册计划任务", null, delegate { RegisterStartupTaskFromUi(); });
+            menu.Items.Add("检查更新", null, async delegate { ShowFromTray(); await CheckForUpdatesAsync(); });
             menu.Items.Add("退出", null, delegate { ExitApplication(); });
 
             trayIcon.Icon = SystemIcons.Application;
@@ -1412,7 +1611,7 @@ namespace EcloudKeepAlive
             }
         }
 
-        internal static bool RegisterWindowsStartupTask(out string errorMessage)
+        internal static bool RegisterWindowsStartupTask(out string errorMessage, string executablePath = null)
         {
             errorMessage = string.Empty;
             try
@@ -1441,9 +1640,10 @@ namespace EcloudKeepAlive
                 trigger.UserId = userId;
 
                 dynamic action = taskDefinition.Actions.Create(TaskActionExec);
-                action.Path = Application.ExecutablePath;
+                executablePath = executablePath ?? Application.ExecutablePath;
+                action.Path = executablePath;
                 action.Arguments = StartupArgument;
-                action.WorkingDirectory = Path.GetDirectoryName(Application.ExecutablePath);
+                action.WorkingDirectory = Path.GetDirectoryName(executablePath);
 
                 rootFolder.RegisterTaskDefinition(
                     StartupTaskName,
@@ -1613,6 +1813,7 @@ namespace EcloudKeepAlive
         {
             if (disposing)
             {
+                updateCancellation?.Cancel();
                 CancelPendingClientKills();
                 timer.Dispose();
                 trayIcon.Dispose();

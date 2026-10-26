@@ -8,5 +8,7 @@
   <ItemGroup>
     <Compile Include="../KeepAliveSchedule.cs" Link="KeepAliveSchedule.cs" />
     <Compile Include="../StartupTaskPolicy.cs" Link="StartupTaskPolicy.cs" />
+    <Compile Include="../ReleaseUpdateClient.cs" Link="ReleaseUpdateClient.cs" />
+    <Compile Include="../UpdateFileTransaction.cs" Link="UpdateFileTransaction.cs" />
   </ItemGroup>
 </Project>

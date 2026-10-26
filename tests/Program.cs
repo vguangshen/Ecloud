@@ -64,6 +64,7 @@ internal static class RegressionTests
 
         if (OperatingSystem.IsWindows()) CheckWindowsTaskSettings();
         else Console.WriteLine("Windows Task Scheduler COM verification skipped on this OS.");
+        checks += UpdateRegressionTests.RunAsync().GetAwaiter().GetResult();
         Console.WriteLine("PASS: " + checks + " assertions; 100-day schedule and 48-hour retry simulation.");
     }
 

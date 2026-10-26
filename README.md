@@ -26,6 +26,14 @@
 
 应为 `PT0S`（或等价的零时长）。此任务在用户登录 Windows 时启动，需要保留交互式登录会话；它不提供关机后自动开机、无人登录启动或平台强制回收后的恢复能力。
 
+## 在线更新
+
+在“更新”页点击“检查更新”，查看新版本说明后点击“在线更新”；托盘菜单也提供“检查更新”。更新来自公开仓库 `vguangshen/Ecloud` 的最新正式 Release，不需要访问令牌。
+
+下载时保活继续运行。文件大小、EXE 格式与 SHA-256 校验通过，且更新器确认就绪后，旧程序才退出。更新器保留原 EXE 的 `.previous` 备份，新版启动确认失败时恢复旧版。新版会恢复更新前的保活状态，已注册的计划任务会同步更新为不限时运行。安装时可能需要当前 Windows 用户的管理员授权。
+
+更新接口为 `https://api.github.com/repos/vguangshen/Ecloud/releases/latest`。正式发布需递增项目版本号，并附带 `EcloudKeepAlive.exe` 和 `EcloudKeepAlive.exe.sha256`；工作流会根据项目版本号生成对应的标签和 ZIP。
+
 ## 排查
 
 运行日志位于 `%APPDATA%\EcloudKeepAlive\runtime.log`，超过 1 MiB 时保留一份 `.previous`。日志记录启动尝试、失败重试、客户端结束以及配置读写异常，不记录密码。
@@ -39,4 +47,4 @@ dotnet run --project tests/RegressionTests.csproj -c Release
 dotnet publish EcloudKeepAlive.csproj -c Release -r win-x64 --self-contained true
 ```
 
-回归测试使用生产调度逻辑推进 100 天，并模拟连续 48 小时的启动失败、恢复、手动执行和修改间隔。Windows 上另外通过实际 Task Scheduler COM 对象检查无限时长、失败重启和序列化后的任务 XML，不注册或运行测试计划任务。时间推进测试不等于真实云环境中的连续驻留验证。
+回归测试使用生产调度逻辑推进 100 天，并模拟连续 48 小时的启动失败、恢复、手动执行和修改间隔，另外检查更新元数据、下载失败、校验失败、取消、文件替换、备份及回滚。Windows 上还检查实际 Task Scheduler COM / XML，并通过发布后的真实 EXE 验证更新器交接、替换和自动重启；测试不注册或运行计划任务。时间推进测试不等于真实云环境中的连续驻留验证。
