@@ -1,4 +1,4 @@
-name: Release v1.0.0
+name: Build and release
 
 on:
   pull_request:
@@ -7,6 +7,10 @@ on:
     paths:
       - EcloudKeepAlive.cs
       - EcloudKeepAlive.csproj
+      - KeepAliveSchedule.cs
+      - StartupTaskPolicy.cs
+      - app.manifest
+      - tests/**
       - .github/workflows/release-v1.0.0.yml
   push:
     branches:
@@ -14,6 +18,10 @@ on:
     paths:
       - EcloudKeepAlive.cs
       - EcloudKeepAlive.csproj
+      - KeepAliveSchedule.cs
+      - StartupTaskPolicy.cs
+      - app.manifest
+      - tests/**
       - .github/workflows/release-v1.0.0.yml
   workflow_dispatch:
 
@@ -34,6 +42,9 @@ jobs:
 
       - name: Restore
         run: dotnet restore EcloudKeepAlive.csproj
+
+      - name: Run scheduler and Windows task regression checks
+        run: dotnet run --project tests/RegressionTests.csproj -c Release
 
       - name: Publish win-x64 single-file
         run: >-
@@ -64,24 +75,28 @@ jobs:
           $hash = (Get-FileHash $exe -Algorithm SHA256).Hash.ToLowerInvariant()
           Set-Content -Path 'artifact/EcloudKeepAlive.exe.sha256' -Value "$hash  EcloudKeepAlive.exe" -Encoding ascii
 
-          Compress-Archive -Path $exe -DestinationPath 'artifact/EcloudKeepAlive-v1.0.0-win-x64.zip' -Force
+          Compress-Archive -Path $exe -DestinationPath 'artifact/EcloudKeepAlive-v1.0.1-win-x64.zip' -Force
 
           @'
-          # EcloudKeepAlive v1.0.0
+          # EcloudKeepAlive v1.0.1
 
-          首个正式版本。
+          修复长期无人值守运行时的计划任务时限与调度问题。
 
-          ## 功能
-          - 定时启动移动云电脑客户端进行保活
-          - 可配置启动后自动结束客户端进程及延迟时间
-          - 支持开机自动运行并通过 Windows 计划任务启用无人值守保活
-          - 支持自动启动 frpc
-          - 支持可选的开机自动设置当前 Windows 用户密码
-          - 托盘运行、立即保活、状态查看与设置持久化
+          ## 修复
+          - Windows 登录计划任务无限运行，不再继承默认 72 小时停止上限
+          - 开始保活时立即启动客户端，启动失败后每 5 分钟重试
+          - 新默认间隔为 6 小时，最长 12 小时；旧间隔超过上限时降至 12 小时
+          - 修改间隔和立即执行会更新实际调度时间
+          - 增加运行日志、配置写入保护和客户端进程资源清理
+          - “启动成功”仅代表客户端进程启动，实际云连接需要检查客户端
+
+          ## 更新后必须操作
+          - 在“启动项”页重新点击“立即注册到 Windows 计划任务中”，覆盖旧任务
+          - 在“状态”页确认“运行不限时”后开始保活
 
           ## 下载
           - `EcloudKeepAlive.exe`：Windows x64 自包含单文件，可直接运行
-          - `EcloudKeepAlive-v1.0.0-win-x64.zip`：压缩包版本
+          - `EcloudKeepAlive-v1.0.1-win-x64.zip`：压缩包版本
           - `EcloudKeepAlive.exe.sha256`：SHA-256 校验值
 
           ## 系统要求
@@ -89,24 +104,32 @@ jobs:
           - 无需单独安装 .NET Runtime
           '@ | Set-Content -Path 'release-notes.md' -Encoding utf8
 
+      - name: Upload verified build for review
+        uses: actions/upload-artifact@v4
+        with:
+          name: EcloudKeepAlive-win-x64
+          path: artifact/*
+          retention-days: 14
+
       - name: Create or update GitHub Release
         if: github.event_name != 'pull_request'
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          $tag = 'v1.0.0'
+          $tag = 'v1.0.1'
           gh release view $tag *> $null
           if ($LASTEXITCODE -ne 0) {
-            gh release create $tag --draft --target $env:GITHUB_SHA --title 'EcloudKeepAlive v1.0.0' --notes-file 'release-notes.md'
+            gh release create $tag --draft --target $env:GITHUB_SHA --title 'EcloudKeepAlive v1.0.1' --notes-file 'release-notes.md'
             if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           }
 
           gh release upload $tag `
             'artifact/EcloudKeepAlive.exe' `
-            'artifact/EcloudKeepAlive-v1.0.0-win-x64.zip' `
+            'artifact/EcloudKeepAlive-v1.0.1-win-x64.zip' `
             'artifact/EcloudKeepAlive.exe.sha256' `
             --clobber
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
-          gh release edit $tag --draft=false --latest --title 'EcloudKeepAlive v1.0.0' --notes-file 'release-notes.md'
+          gh release edit $tag --draft=false --latest --title 'EcloudKeepAlive v1.0.1' --notes-file 'release-notes.md'
+

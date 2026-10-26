@@ -91,6 +91,8 @@ namespace EcloudKeepAlive
         private const int TaskTriggerLogon = 9;
 
         private readonly Timer timer = new Timer();
+        private readonly KeepAliveSchedule schedule = new KeepAliveSchedule();
+        private readonly Dictionary<Timer, Process> pendingClientKills = new Dictionary<Timer, Process>();
         private readonly NotifyIcon trayIcon = new NotifyIcon();
         private readonly string settingsPath;
 
@@ -107,7 +109,9 @@ namespace EcloudKeepAlive
         private Label statusLabel;
         private Button startButton;
         private Button stopButton;
-        private DateTime? nextRunAt;
+        private bool isAttemptRunning;
+        private bool settingsReadFailed;
+        private string lastStatusMessage = "未启动";
         private bool reallyExit;
         private bool loadingSettings;
         private bool newPasswordVisible;
@@ -148,12 +152,14 @@ namespace EcloudKeepAlive
             LoadSettings();
             ConfigureTrayIcon();
 
+            timer.Interval = 1000;
             timer.Tick += OnTimerTick;
+            WriteLog("程序启动，命令行启动模式：" + IsStartedFromWindowsStartup());
             RunStartupTasks();
 
             if (IsStartedFromWindowsStartup())
             {
-                StartKeepAlive();
+                StartKeepAlive(false);
             }
             else
             {
@@ -262,8 +268,14 @@ namespace EcloudKeepAlive
             clientCard.Controls.Add(browseButton, 2, 0);
 
             clientCard.Controls.Add(CreateFieldLabel("连接间隔"), 0, 1);
-            intervalNumeric = new NumericUpDown { Minimum = 1, Maximum = 10080, Value = 1380, Width = 90 };
-            var intervalPanel = CreateValuePanel(intervalNumeric, "分钟，推荐 1380 分钟");
+            intervalNumeric = new NumericUpDown { Minimum = 1, Maximum = KeepAliveSchedule.MaximumIntervalMinutes, Value = KeepAliveSchedule.DefaultIntervalMinutes, Width = 90 };
+            intervalNumeric.ValueChanged += delegate
+            {
+                if (loadingSettings || !schedule.Enabled) return;
+                schedule.ChangeInterval(Environment.TickCount64, (int)intervalNumeric.Value);
+                UpdateStatus("连接间隔已立即更新。");
+            };
+            var intervalPanel = CreateValuePanel(intervalNumeric, "分钟，推荐 360，最长 720 分钟");
             clientCard.Controls.Add(intervalPanel, 1, 1);
             clientCard.SetColumnSpan(intervalPanel, 2);
 
@@ -281,9 +293,9 @@ namespace EcloudKeepAlive
             var killCard = CreateCard("客户端收尾", 2);
             root.Controls.Add(killCard, 0, 1);
 
-            killClientDelayNumeric = new NumericUpDown { Minimum = 5, Maximum = 600, Value = 30, Width = 90 };
+            killClientDelayNumeric = new NumericUpDown { Minimum = 5, Maximum = 600, Value = 120, Width = 90 };
             killCard.Controls.Add(CreateFieldLabel("结束延迟"), 0, 0);
-            var killDelayPanel = CreateValuePanel(killClientDelayNumeric, "秒，默认 30 秒");
+            var killDelayPanel = CreateValuePanel(killClientDelayNumeric, "秒，默认 120 秒，请确认已完成连接");
             killCard.Controls.Add(killDelayPanel, 1, 0);
             killCard.SetColumnSpan(killDelayPanel, 2);
 
@@ -317,7 +329,7 @@ namespace EcloudKeepAlive
             startButton.Click += delegate { StartKeepAlive(); };
             stopButton.Click += delegate { StopKeepAlive(); };
             triggerButton.Click += delegate { RunKeepAliveNow(); };
-            saveButton.Click += delegate { SaveSettings(); MessageBox.Show("设置已保存。", Text, MessageBoxButtons.OK, MessageBoxIcon.Information); };
+            saveButton.Click += delegate { if (SaveSettings(true)) MessageBox.Show("设置已保存。", Text, MessageBoxButtons.OK, MessageBoxIcon.Information); };
 
             actionBar.Controls.Add(startButton);
             actionBar.Controls.Add(stopButton);
@@ -640,23 +652,23 @@ namespace EcloudKeepAlive
             }
         }
 
-        private void StartKeepAlive()
+        private void StartKeepAlive(bool showMessage = true)
         {
-            if (!ValidateClientPath())
+            if (showMessage && !ValidateClientPath())
             {
                 return;
             }
 
-            SaveSettings();
+            SaveSettings(showMessage);
             timer.Stop();
-            timer.Interval = Math.Max(1, (int)intervalNumeric.Value) * 60 * 1000;
+            schedule.Start(Environment.TickCount64, (int)intervalNumeric.Value);
             timer.Start();
-            nextRunAt = DateTime.Now.AddMinutes((double)intervalNumeric.Value);
 
             startButton.Enabled = false;
             stopButton.Enabled = true;
 
-            UpdateStatus("保活已启动，等待下一次计划连接。");
+            WriteLog("定时保活已启动，间隔 " + intervalNumeric.Value + " 分钟。");
+            RunKeepAliveAttempt(false);
         }
 
         private void RunKeepAliveNow()
@@ -664,41 +676,59 @@ namespace EcloudKeepAlive
             if (!timer.Enabled)
             {
                 StartKeepAlive();
-                if (!timer.Enabled)
-                {
-                    return;
-                }
+                return; // StartKeepAlive already makes the first attempt.
             }
 
-            if (LaunchClient(true))
-            {
-                nextRunAt = DateTime.Now.AddMinutes((double)intervalNumeric.Value);
-                UpdateStatus("已立即保活，并已启用定时保活。");
-            }
+            RunKeepAliveAttempt(true);
         }
 
         private void StopKeepAlive()
         {
             timer.Stop();
-            nextRunAt = null;
+            schedule.Stop();
+            CancelPendingClientKills();
             startButton.Enabled = true;
             stopButton.Enabled = false;
             UpdateStatus("已停止。");
+            WriteLog("定时保活已停止。");
             SaveSettings();
         }
 
         private void OnTimerTick(object sender, EventArgs e)
         {
-            if (LaunchClient(false))
+            if (schedule.IsDue(Environment.TickCount64)) RunKeepAliveAttempt(false);
+            else UpdateStatus(lastStatusMessage);
+        }
+
+        private void RunKeepAliveAttempt(bool showMessage)
+        {
+            if (isAttemptRunning || !schedule.Enabled) return;
+            isAttemptRunning = true;
+            try
             {
-                nextRunAt = DateTime.Now.AddMinutes((double)intervalNumeric.Value);
-                UpdateStatus("已按计划连接一次。");
+                var started = LaunchClient(showMessage);
+                schedule.CompleteAttempt(Environment.TickCount64, started);
+                var message = started
+                    ? "已启动客户端；实际云连接尚未验证。"
+                    : "客户端启动失败，5 分钟后重试。";
+                UpdateStatus(message);
+                WriteLog(message);
+            }
+            catch (Exception ex)
+            {
+                schedule.CompleteAttempt(Environment.TickCount64, false);
+                WriteLog("保活尝试异常，5 分钟后重试：" + ex);
+                UpdateStatus("保活尝试异常，5 分钟后重试：" + ex.Message);
+            }
+            finally
+            {
+                isAttemptRunning = false;
             }
         }
 
         private bool LaunchClient(bool showMessage)
         {
-            if (!ValidateClientPath())
+            if (!ValidateClientPath(showMessage))
             {
                 return false;
             }
@@ -724,7 +754,8 @@ namespace EcloudKeepAlive
             }
             catch (Exception ex)
             {
-                MessageBox.Show("启动客户端失败：\r\n" + ex.Message, Text, MessageBoxButtons.OK, MessageBoxIcon.Error);
+                WriteLog("启动客户端失败：" + ex);
+                if (showMessage) MessageBox.Show("启动客户端失败：\r\n" + ex.Message, Text, MessageBoxButtons.OK, MessageBoxIcon.Error);
                 UpdateStatus("启动失败：" + ex.Message);
                 return false;
             }
@@ -735,6 +766,7 @@ namespace EcloudKeepAlive
             if (!autoKillClientCheckBox.Checked)
             {
                 lastClientKillStatus = "未启用";
+                if (process != null) process.Dispose();
                 return;
             }
 
@@ -750,9 +782,22 @@ namespace EcloudKeepAlive
             {
                 killTimer.Stop();
                 killTimer.Dispose();
+                pendingClientKills.Remove(killTimer);
                 KillClientProcess(process, processName, clientPath);
             };
+            pendingClientKills.Add(killTimer, process);
             killTimer.Start();
+        }
+
+        private void CancelPendingClientKills()
+        {
+            foreach (var pending in pendingClientKills)
+            {
+                pending.Key.Stop();
+                pending.Key.Dispose();
+                if (pending.Value != null) pending.Value.Dispose();
+            }
+            pendingClientKills.Clear();
         }
 
         private void KillClientProcess(Process startedProcess, string processName, string clientPath)
@@ -797,7 +842,9 @@ namespace EcloudKeepAlive
             {
             }
 
+            if (startedProcess != null) startedProcess.Dispose();
             lastClientKillStatus = killed > 0 ? "已结束客户端进程 " + killed + " 个" : "未发现需要结束的客户端进程";
+            WriteLog(lastClientKillStatus);
             UpdateStatus(lastClientKillStatus);
         }
 
@@ -1067,7 +1114,7 @@ namespace EcloudKeepAlive
             }
         }
 
-        private bool ValidateClientPath()
+        private bool ValidateClientPath(bool showMessage = true)
         {
             var path = clientPathTextBox.Text.Trim();
             if (File.Exists(path))
@@ -1075,13 +1122,16 @@ namespace EcloudKeepAlive
                 return true;
             }
 
-            MessageBox.Show("找不到云电脑客户端程序，请检查路径。", Text, MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            if (showMessage) MessageBox.Show("找不到云电脑客户端程序，请检查路径。", Text, MessageBoxButtons.OK, MessageBoxIcon.Warning);
             UpdateStatus("客户端路径无效。");
             return false;
         }
 
         private void UpdateStatus(string message)
         {
+            lastStatusMessage = message;
+            var remaining = schedule.Remaining(Environment.TickCount64);
+            var nextRunAt = remaining.HasValue ? DateTime.Now.Add(remaining.Value) : (DateTime?)null;
             var builder = new StringBuilder();
             builder.AppendLine("状态：" + message);
             builder.AppendLine("当前时间：" + DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss"));
@@ -1094,6 +1144,7 @@ namespace EcloudKeepAlive
             builder.AppendLine("密码修改状态：" + lastPasswordChangeStatus);
             builder.AppendLine("计划任务状态：" + lastStartupTaskStatus);
             builder.AppendLine("下次计划连接：" + (nextRunAt.HasValue ? nextRunAt.Value.ToString("yyyy-MM-dd HH:mm:ss") : "无"));
+            builder.AppendLine("运行日志：" + Path.Combine(Path.GetDirectoryName(settingsPath), "runtime.log"));
             statusLabel.Text = builder.ToString();
             trayIcon.Text = nextRunAt.HasValue ? "移动云电脑保活 - 运行中" : "移动云电脑保活";
         }
@@ -1129,7 +1180,7 @@ namespace EcloudKeepAlive
 
             RemoveLegacyStartupEntry();
             startWithWindowsCheckBox.Checked = IsStartWithWindowsEnabled();
-            lastStartupTaskStatus = startWithWindowsCheckBox.Checked ? "已注册" : "未注册";
+            lastStartupTaskStatus = GetStartupTaskStatus();
             loadingSettings = false;
         }
 
@@ -1141,30 +1192,71 @@ namespace EcloudKeepAlive
                 return settings;
             }
 
-            foreach (var line in File.ReadAllLines(settingsPath, Encoding.UTF8))
+            try
             {
-                var index = line.IndexOf('=');
-                if (index <= 0) continue;
-                settings[line.Substring(0, index)] = line.Substring(index + 1);
+                foreach (var line in File.ReadAllLines(settingsPath, Encoding.UTF8))
+                {
+                    var index = line.IndexOf('=');
+                    if (index <= 0) continue;
+                    settings[line.Substring(0, index)] = line.Substring(index + 1);
+                }
+            }
+            catch (Exception ex)
+            {
+                settingsReadFailed = true;
+                WriteLog("读取配置失败，保留原文件：" + ex);
             }
             return settings;
         }
 
-        private void SaveSettings()
+        private bool SaveSettings(bool showMessage = false)
         {
-            Directory.CreateDirectory(Path.GetDirectoryName(settingsPath));
-            var lines = new[]
+            string temporaryPath = null;
+            try
             {
-                "ClientPath=" + clientPathTextBox.Text.Trim(),
-                "IntervalMinutes=" + intervalNumeric.Value,
-                "AutoKillClient=" + autoKillClientCheckBox.Checked.ToString().ToLowerInvariant(),
-                "KillClientDelaySeconds=" + killClientDelayNumeric.Value,
-                "FrpDirectory=" + frpDirectoryTextBox.Text.Trim(),
-                "AutoStartFrpc=" + autoStartFrpcCheckBox.Checked.ToString().ToLowerInvariant(),
-                "AutoChangePassword=" + autoChangePasswordCheckBox.Checked.ToString().ToLowerInvariant(),
-                "NewPasswordProtectedBase64=" + ProtectPassword(newPasswordTextBox.Text)
-            };
-            File.WriteAllLines(settingsPath, lines, Encoding.UTF8);
+                if (settingsReadFailed) throw new IOException("原配置读取失败，为保护原文件，本次未覆盖配置。请检查文件权限并重启工具。");
+                Directory.CreateDirectory(Path.GetDirectoryName(settingsPath));
+                var lines = new[]
+                {
+                    "ClientPath=" + clientPathTextBox.Text.Trim(),
+                    "IntervalMinutes=" + intervalNumeric.Value,
+                    "AutoKillClient=" + autoKillClientCheckBox.Checked.ToString().ToLowerInvariant(),
+                    "KillClientDelaySeconds=" + killClientDelayNumeric.Value,
+                    "FrpDirectory=" + frpDirectoryTextBox.Text.Trim(),
+                    "AutoStartFrpc=" + autoStartFrpcCheckBox.Checked.ToString().ToLowerInvariant(),
+                    "AutoChangePassword=" + autoChangePasswordCheckBox.Checked.ToString().ToLowerInvariant(),
+                    "NewPasswordProtectedBase64=" + ProtectPassword(newPasswordTextBox.Text)
+                };
+                temporaryPath = settingsPath + "." + Guid.NewGuid().ToString("N") + ".tmp";
+                File.WriteAllLines(temporaryPath, lines, Encoding.UTF8);
+                File.Move(temporaryPath, settingsPath, true);
+                return true;
+            }
+            catch (Exception ex)
+            {
+                WriteLog("保存配置失败：" + ex);
+                if (showMessage) MessageBox.Show("保存配置失败：\r\n" + ex.Message, Text, MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                return false;
+            }
+            finally
+            {
+                try { if (temporaryPath != null && File.Exists(temporaryPath)) File.Delete(temporaryPath); }
+                catch { }
+            }
+        }
+
+        private void WriteLog(string message)
+        {
+            try
+            {
+                var directory = Path.GetDirectoryName(settingsPath);
+                Directory.CreateDirectory(directory);
+                var logPath = Path.Combine(directory, "runtime.log");
+                if (File.Exists(logPath) && new FileInfo(logPath).Length > 1024 * 1024)
+                    File.Move(logPath, logPath + ".previous", true);
+                File.AppendAllText(logPath, DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss") + " " + message + Environment.NewLine, Encoding.UTF8);
+            }
+            catch { } // A full disk or unavailable log directory must not stop keep-alive.
         }
 
         private void RegisterStartupTaskFromUi()
@@ -1177,15 +1269,10 @@ namespace EcloudKeepAlive
                 return;
             }
 
-            try
+            if (!SaveSettings(true))
             {
-                SaveSettings();
-            }
-            catch (Exception ex)
-            {
-                lastStartupTaskStatus = "未注册，保存设置失败：" + ex.Message;
+                lastStartupTaskStatus = "未注册，保存设置失败。";
                 UpdateStatus(lastStartupTaskStatus);
-                MessageBox.Show(lastStartupTaskStatus, Text, MessageBoxButtons.OK, MessageBoxIcon.Warning);
                 return;
             }
 
@@ -1203,10 +1290,10 @@ namespace EcloudKeepAlive
 
             RemoveLegacyStartupEntry();
             SetStartWithWindowsCheckbox(true);
-            lastStartupTaskStatus = "已注册，开机将自动启动本工具并启用保活";
+            lastStartupTaskStatus = "已注册，运行不限时，登录 Windows 后自动启用保活";
             UpdateStatus(lastStartupTaskStatus);
             MessageBox.Show(
-                "Windows 计划任务注册成功。以后开机时会自动启动本工具并启用保活，无需再次点击管理员授权。",
+                "Windows 计划任务注册成功，运行时间不限。以后登录 Windows 时会自动启动本工具并启用保活，无需再次点击管理员授权。",
                 Text,
                 MessageBoxButtons.OK,
                 MessageBoxIcon.Information);
@@ -1218,22 +1305,15 @@ namespace EcloudKeepAlive
             {
                 if (IsStartupTaskRegistered())
                 {
-                    RemoveLegacyStartupEntry();
-                    lastStartupTaskStatus = "已注册";
-                    UpdateStatus(lastStartupTaskStatus);
-                    return;
+                    // Always re-register: an older task may still carry the 72-hour limit.
+                    lastStartupTaskStatus = "正在更新已有计划任务...";
                 }
 
-                try
-                {
-                    SaveSettings();
-                }
-                catch (Exception ex)
+                if (!SaveSettings(true))
                 {
                     SetStartWithWindowsCheckbox(false);
-                    lastStartupTaskStatus = "未注册，保存设置失败：" + ex.Message;
+                    lastStartupTaskStatus = "未注册，保存设置失败。";
                     UpdateStatus(lastStartupTaskStatus);
-                    MessageBox.Show(lastStartupTaskStatus, Text, MessageBoxButtons.OK, MessageBoxIcon.Warning);
                     return;
                 }
 
@@ -1241,7 +1321,7 @@ namespace EcloudKeepAlive
                 if (RunElevatedTaskOperation(RegisterStartupTaskArgument, out errorMessage))
                 {
                     RemoveLegacyStartupEntry();
-                    lastStartupTaskStatus = "已注册";
+                    lastStartupTaskStatus = "已注册，运行不限时";
                     UpdateStatus(lastStartupTaskStatus);
                     return;
                 }
@@ -1351,9 +1431,7 @@ namespace EcloudKeepAlive
                 var userId = GetCurrentUserId();
 
                 taskDefinition.RegistrationInfo.Description = "移动云电脑保活无人值守启动任务";
-                taskDefinition.Settings.Enabled = true;
-                taskDefinition.Settings.StartWhenAvailable = true;
-                taskDefinition.Settings.AllowDemandStart = true;
+                StartupTaskPolicy.Configure(taskDefinition.Settings);
                 taskDefinition.Principal.UserId = userId;
                 taskDefinition.Principal.LogonType = TaskLogonInteractiveToken;
                 taskDefinition.Principal.RunLevel = TaskRunLevelHighest;
@@ -1429,13 +1507,33 @@ namespace EcloudKeepAlive
                 dynamic service = Activator.CreateInstance(serviceType);
                 service.Connect();
                 dynamic rootFolder = service.GetFolder("\\");
-                rootFolder.GetTask(StartupTaskName);
-                return true;
+                dynamic task = rootFolder.GetTask(StartupTaskName);
+                return task.Enabled;
             }
             catch
             {
                 return false;
             }
+        }
+
+        private static string GetStartupTaskStatus()
+        {
+            try
+            {
+                var serviceType = Type.GetTypeFromProgID("Schedule.Service");
+                if (serviceType == null) return "任务计划程序不可用";
+                dynamic service = Activator.CreateInstance(serviceType);
+                service.Connect();
+                dynamic task = service.GetFolder("\\").GetTask(StartupTaskName);
+                if (!task.Enabled) return "任务已禁用，请重新注册";
+                string limit = task.Definition.Settings.ExecutionTimeLimit;
+                if (!StartupTaskPolicy.HasUnlimitedExecutionTime(limit))
+                    return "旧任务存在运行时限，请点击“立即注册到 Windows 计划任务中”更新";
+                if (!string.Equals((string)task.Definition.Actions.Item(1).Path, Application.ExecutablePath, StringComparison.OrdinalIgnoreCase))
+                    return "任务指向其他程序路径，请重新注册";
+                return "已注册，运行不限时（登录 Windows 时启动）";
+            }
+            catch { return "未注册或无法读取任务，请重新注册"; }
         }
 
         private static string GetCurrentUserId()
@@ -1515,6 +1613,7 @@ namespace EcloudKeepAlive
         {
             if (disposing)
             {
+                CancelPendingClientKills();
                 timer.Dispose();
                 trayIcon.Dispose();
             }
@@ -1522,3 +1621,4 @@ namespace EcloudKeepAlive
         }
     }
 }
+
